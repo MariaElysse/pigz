@@ -27,7 +27,6 @@
 // For thread portability.
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
-#define _THREAD_SAFE
 
 // Use large file functions if available.
 #define _FILE_OFFSET_BITS 64
@@ -47,7 +46,7 @@
 
 // Interface definition.
 #include "yarn.h"
-
+#include "try.h"
 // Constants.
 #define local static            // for non-exported functions and globals
 
@@ -288,6 +287,7 @@ local void *ignition(void *arg) {
 // is made explicit here.
 thread *launch_(void (*probe)(void *), void *payload,
                 char const *file, long line) {
+	ball_t err;
     // construct the requested call and argument for the ignition() routine
     // (allocated instead of automatic so that we're sure this will still be
     // there when ignition() actually starts up -- ignition() will free this
@@ -305,19 +305,40 @@ thread *launch_(void (*probe)(void *), void *payload,
     // create the thread and call ignition() from that thread
     thread *th = my_malloc(sizeof(struct thread_s), file, line);
     pthread_attr_t attr;
-    int ret = pthread_attr_init(&attr);
-    if (ret)
-        fail(ret, file, line, "attr_init");
-    ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-    if (ret)
-        fail(ret, file, line, "attr_setdetachstate");
-    ret = pthread_create(&(th->id), &attr, ignition, capsule);
-    if (ret)
-        fail(ret, file, line, "create");
-    ret = pthread_attr_destroy(&attr);
-    if (ret)
-        fail(ret, file, line, "attr_destroy");
+	try {
 
+		fprintf(stderr, "In try");
+		int ret = pthread_attr_init(&attr);
+		throw(1, "always");
+		if (ret)
+			throw(ret, "attr_init");
+		ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+		if (ret)
+			throw(ret, "attr_setdetachstate");
+		ret = pthread_create(&(th->id), &attr, ignition, capsule);
+		if (ret)
+			throw(ret, "create");
+		ret = pthread_attr_destroy(&attr);
+		if (ret)
+			fail(ret, file, line, "attr_destroy");
+	} catch (err) {
+		// if ENOSYS, return null. the caller (parallel_compress/load) will handle this.
+		// POSIX guarantees that if a syscall returns ENOSYS once it will
+		// return and has always returned ENOSYS. So there isn't a possiblility
+		// of problems occurring because earlier calls to launch() succeeding then
+		// later calls failing, causing null pointer madness instead of
+		// a clean failure as you would expect.
+		// ENOSYS is the only failure that can be handled this way!
+		if (err.code == 1) { //should always fail. let's see if it works.
+			my_free(th);
+			my_free(capsule);
+			drop(err);
+			fputs("Hit enosys", stderr);
+			return NULL;
+		} else {
+			fail(err.code, file, line, err.why);
+		}
+	}
     // put the thread in the threads list for join_all()
     th->done = 0;
     th->next = threads;

@@ -2020,187 +2020,6 @@ local void append_len(struct job *job, size_t len) {
     }
 }
 
-// Compress ind to outd, using multiple threads for the compression and check
-// value calculations and one other thread for writing the output. Compress
-// threads will be launched and left running (waiting actually) to support
-// subsequent calls of parallel_compress().
-local void parallel_compress(void) {
-    long seq;                       // sequence number
-    struct space *curr;             // input data to compress
-    struct space *next;             // input data that follows curr
-    struct space *hold;             // input data that follows next
-    struct space *dict;             // dictionary for next compression
-    struct job *job;                // job for compress, then write
-    int more;                       // true if more input to read
-    unsigned hash;                  // hash for rsyncable
-    unsigned char *scan;            // next byte to compute hash on
-    unsigned char *end;             // after end of data to compute hash on
-    unsigned char *last;            // position after last hit
-    size_t left;                    // last hit in curr to end of curr
-    size_t len;                     // for various length computations
-
-    // if first time or after an option change, setup the job lists
-    setup_jobs();
-
-    // start write thread
-    writeth = launch(write_thread, NULL);
-
-    // read from input and start compress threads (write thread will pick up
-    // the output of the compress threads)
-    seq = 0;
-    next = get_space(&in_pool);
-    next->len = readn(g.ind, next->buf, next->size);
-    hold = NULL;
-    dict = NULL;
-    scan = next->buf;
-    hash = RSYNCHIT;
-    left = 0;
-    do {
-        // create a new job
-        job = alloc(NULL, sizeof(struct job));
-        job->calc = new_lock(0);
-
-        // update input spaces
-        curr = next;
-        next = hold;
-        hold = NULL;
-
-        // get more input if we don't already have some
-        if (next == NULL) {
-            next = get_space(&in_pool);
-            next->len = readn(g.ind, next->buf, next->size);
-        }
-
-        // if rsyncable, generate block lengths and prepare curr for job to
-        // likely have less than size bytes (up to the last hash hit)
-        job->lens = NULL;
-        if (g.rsync && curr->len) {
-            // compute the hash function starting where we last left off to
-            // cover either size bytes or to EOF, whichever is less, through
-            // the data in curr (and in the next loop, through next) -- save
-            // the block lengths resulting from the hash hits in the job->lens
-            // list
-            if (left == 0) {
-                // scan is in curr
-                last = curr->buf;
-                end = curr->buf + curr->len;
-                while (scan < end) {
-                    hash = ((hash << 1) ^ *scan++) & RSYNCMASK;
-                    if (hash == RSYNCHIT) {
-                        len = (size_t)(scan - last);
-                        append_len(job, len);
-                        last = scan;
-                    }
-                }
-
-                // continue scan in next
-                left = (size_t)(scan - last);
-                scan = next->buf;
-            }
-
-            // scan in next for enough bytes to fill curr, or what is available
-            // in next, whichever is less (if next isn't full, then we're at
-            // the end of the file) -- the bytes in curr since the last hit,
-            // stored in left, counts towards the size of the first block
-            last = next->buf;
-            len = curr->size - curr->len;
-            if (len > next->len)
-                len = next->len;
-            end = next->buf + len;
-            while (scan < end) {
-                hash = ((hash << 1) ^ *scan++) & RSYNCMASK;
-                if (hash == RSYNCHIT) {
-                    len = (size_t)(scan - last) + left;
-                    left = 0;
-                    append_len(job, len);
-                    last = scan;
-                }
-            }
-            append_len(job, 0);
-
-            // create input in curr for job up to last hit or entire buffer if
-            // no hits at all -- save remainder in next and possibly hold
-            len = (size_t)((job->lens->len == 1 ? scan : last) - next->buf);
-            if (len) {
-                // got hits in next, or no hits in either -- copy to curr
-                memcpy(curr->buf + curr->len, next->buf, len);
-                curr->len += len;
-                memmove(next->buf, next->buf + len, next->len - len);
-                next->len -= len;
-                scan -= len;
-                left = 0;
-            }
-            else if (job->lens->len != 1 && left && next->len) {
-                // had hits in curr, but none in next, and last hit in curr
-                // wasn't right at the end, so we have input there to save --
-                // use curr up to the last hit, save the rest, moving next to
-                // hold
-                hold = next;
-                next = get_space(&in_pool);
-                memcpy(next->buf, curr->buf + (curr->len - left), left);
-                next->len = left;
-                curr->len -= left;
-            }
-            else {
-                // else, last match happened to be right at the end of curr, or
-                // we're at the end of the input compressing the rest
-                left = 0;
-            }
-        }
-
-        // compress curr->buf to curr->len -- compress thread will drop curr
-        job->in = curr;
-
-        // set job->more if there is more to compress after curr
-        more = next->len != 0;
-        job->more = more;
-
-        // provide dictionary for this job, prepare dictionary for next job
-        job->out = dict;
-        if (more && g.setdict) {
-            if (curr->len >= DICT || job->out == NULL) {
-                dict = curr;
-                use_space(dict);
-            }
-            else {
-                dict = get_space(&dict_pool);
-                len = DICT - curr->len;
-                memcpy(dict->buf, job->out->buf + (job->out->len - len), len);
-                memcpy(dict->buf + len, curr->buf, curr->len);
-                dict->len = DICT;
-            }
-        }
-
-        // preparation of job is complete
-        job->seq = seq;
-        Trace(("-- read #%ld%s", seq, more ? "" : " (last)"));
-        if (++seq < 1)
-            throw(ERANGE, "overflow");
-
-        // start another compress thread if needed
-        if (cthreads < seq && cthreads < g.procs) {
-            (void)launch(compress_thread, NULL);
-            cthreads++;
-        }
-
-        // put job at end of compress list, let all the compressors know
-        possess(compress_have);
-        job->next = NULL;
-        *compress_tail = job;
-        compress_tail = &(job->next);
-        twist(compress_have, BY, +1);
-    } while (more);
-    drop_space(next);
-
-    // wait for the write thread to complete (we leave the compress threads out
-    // there and waiting in case there is another stream to compress)
-    join(writeth);
-    writeth = NULL;
-    Trace(("-- write thread joined"));
-}
-
-#endif
-
 // Repeated code in single_compress to compress available input and write it.
 #define DEFLATE_WRITE(flush) \
     do { \
@@ -2471,6 +2290,200 @@ local void single_compress(int reset) {
     put_trailer(ulen, clen, check, head);
 }
 
+// Compress ind to outd, using multiple threads for the compression and check
+// value calculations and one other thread for writing the output. Compress
+// threads will be launched and left running (waiting actually) to support
+// subsequent calls of parallel_compress().
+local void parallel_compress(void) {
+    long seq;                       // sequence number
+    struct space *curr;             // input data to compress
+    struct space *next;             // input data that follows curr
+    struct space *hold;             // input data that follows next
+    struct space *dict;             // dictionary for next compression
+    struct job *job;                // job for compress, then write
+    int more;                       // true if more input to read
+    unsigned hash;                  // hash for rsyncable
+    unsigned char *scan;            // next byte to compute hash on
+    unsigned char *end;             // after end of data to compute hash on
+    unsigned char *last;            // position after last hit
+    size_t left;                    // last hit in curr to end of curr
+    size_t len;                     // for various length computations
+
+    // if first time or after an option change, setup the job lists
+    setup_jobs();
+
+    // start write thread
+    writeth = launch(write_thread, NULL);
+
+	// if pthread is not implemented, just do single_compress().
+	// launch() returns NULL on the only tolerable error (ENOSYS), and we fall
+	// back to non-threaded compression. This NULL return can only happen
+	// here, as long as the error handling behavior in launch() only returns 
+	// NULL on ENOSYS.
+	// note: see load()
+	if (!writeth) {
+		complain("pthreads unavailable, falling back to single-threaded mode");
+		g.procs = 1;
+		single_compress(0);
+		return;
+	}
+    // read from input and start compress threads (write thread will pick up
+    // the output of the compress threads)
+    seq = 0;
+    next = get_space(&in_pool);
+    next->len = readn(g.ind, next->buf, next->size);
+    hold = NULL;
+    dict = NULL;
+    scan = next->buf;
+    hash = RSYNCHIT;
+    left = 0;
+    do {
+        // create a new job
+        job = alloc(NULL, sizeof(struct job));
+        job->calc = new_lock(0);
+
+        // update input spaces
+        curr = next;
+        next = hold;
+        hold = NULL;
+
+        // get more input if we don't already have some
+        if (next == NULL) {
+            next = get_space(&in_pool);
+            next->len = readn(g.ind, next->buf, next->size);
+        }
+
+        // if rsyncable, generate block lengths and prepare curr for job to
+        // likely have less than size bytes (up to the last hash hit)
+        job->lens = NULL;
+        if (g.rsync && curr->len) {
+            // compute the hash function starting where we last left off to
+            // cover either size bytes or to EOF, whichever is less, through
+            // the data in curr (and in the next loop, through next) -- save
+            // the block lengths resulting from the hash hits in the job->lens
+            // list
+            if (left == 0) {
+                // scan is in curr
+                last = curr->buf;
+                end = curr->buf + curr->len;
+                while (scan < end) {
+                    hash = ((hash << 1) ^ *scan++) & RSYNCMASK;
+                    if (hash == RSYNCHIT) {
+                        len = (size_t)(scan - last);
+                        append_len(job, len);
+                        last = scan;
+                    }
+                }
+
+                // continue scan in next
+                left = (size_t)(scan - last);
+                scan = next->buf;
+            }
+
+            // scan in next for enough bytes to fill curr, or what is available
+            // in next, whichever is less (if next isn't full, then we're at
+            // the end of the file) -- the bytes in curr since the last hit,
+            // stored in left, counts towards the size of the first block
+            last = next->buf;
+            len = curr->size - curr->len;
+            if (len > next->len)
+                len = next->len;
+            end = next->buf + len;
+            while (scan < end) {
+                hash = ((hash << 1) ^ *scan++) & RSYNCMASK;
+                if (hash == RSYNCHIT) {
+                    len = (size_t)(scan - last) + left;
+                    left = 0;
+                    append_len(job, len);
+                    last = scan;
+                }
+            }
+            append_len(job, 0);
+
+            // create input in curr for job up to last hit or entire buffer if
+            // no hits at all -- save remainder in next and possibly hold
+            len = (size_t)((job->lens->len == 1 ? scan : last) - next->buf);
+            if (len) {
+                // got hits in next, or no hits in either -- copy to curr
+                memcpy(curr->buf + curr->len, next->buf, len);
+                curr->len += len;
+                memmove(next->buf, next->buf + len, next->len - len);
+                next->len -= len;
+                scan -= len;
+                left = 0;
+            }
+            else if (job->lens->len != 1 && left && next->len) {
+                // had hits in curr, but none in next, and last hit in curr
+                // wasn't right at the end, so we have input there to save --
+                // use curr up to the last hit, save the rest, moving next to
+                // hold
+                hold = next;
+                next = get_space(&in_pool);
+                memcpy(next->buf, curr->buf + (curr->len - left), left);
+                next->len = left;
+                curr->len -= left;
+            }
+            else {
+                // else, last match happened to be right at the end of curr, or
+                // we're at the end of the input compressing the rest
+                left = 0;
+            }
+        }
+
+        // compress curr->buf to curr->len -- compress thread will drop curr
+        job->in = curr;
+
+        // set job->more if there is more to compress after curr
+        more = next->len != 0;
+        job->more = more;
+
+        // provide dictionary for this job, prepare dictionary for next job
+        job->out = dict;
+        if (more && g.setdict) {
+            if (curr->len >= DICT || job->out == NULL) {
+                dict = curr;
+                use_space(dict);
+            }
+            else {
+                dict = get_space(&dict_pool);
+                len = DICT - curr->len;
+                memcpy(dict->buf, job->out->buf + (job->out->len - len), len);
+                memcpy(dict->buf + len, curr->buf, curr->len);
+                dict->len = DICT;
+            }
+        }
+
+        // preparation of job is complete
+        job->seq = seq;
+        Trace(("-- read #%ld%s", seq, more ? "" : " (last)"));
+        if (++seq < 1)
+            throw(ERANGE, "overflow");
+
+        // start another compress thread if needed
+        if (cthreads < seq && cthreads < g.procs) {
+            (void)launch(compress_thread, NULL);
+            cthreads++;
+        }
+
+        // put job at end of compress list, let all the compressors know
+        possess(compress_have);
+        job->next = NULL;
+        *compress_tail = job;
+        compress_tail = &(job->next);
+        twist(compress_have, BY, +1);
+    } while (more);
+    drop_space(next);
+
+    // wait for the write thread to complete (we leave the compress threads out
+    // there and waiting in case there is another stream to compress)
+    join(writeth);
+    writeth = NULL;
+    Trace(("-- write thread joined"));
+}
+
+#endif
+
+
 // --- decompression ---
 
 #ifndef NOTHREAD
@@ -2531,34 +2544,47 @@ local size_t load(void) {
     // if first time in or procs == 1, read a buffer to have something to
     // return, otherwise wait for the previous read job to complete
     if (g.procs > 1) {
-        // if first time, fire up the read thread, ask for a read
-        if (g.in_which == -1) {
-            g.in_which = 1;
-            g.load_state = new_lock(1);
-            g.load_thread = launch(load_read, NULL);
-        }
+		ball_t err;
+		try {
+			// if first time, fire up the read thread, ask for a read
+			if (g.in_which == -1) {
+				g.load_thread = launch(load_read, NULL);
+				if (!g.load_thread) {
+					throw(1);
+				}
+				g.in_which = 1;
+				g.load_state = new_lock(1);
+			}
 
-        // wait for the previously requested read to complete
-        load_wait();
+			// wait for the previously requested read to complete
+			load_wait();
 
-        // set up input buffer with the data just read
-        g.in_next = g.in_which ? g.in_buf : g.in_buf2;
-        g.in_left = g.in_len;
+			// set up input buffer with the data just read
+			g.in_next = g.in_which ? g.in_buf : g.in_buf2;
+			g.in_left = g.in_len;
 
-        // if not at end of file, alert read thread to load next buffer,
-        // alternate between g.in_buf and g.in_buf2
-        if (g.in_len == BUF) {
-            g.in_which = 1 - g.in_which;
-            possess(g.load_state);
-            twist(g.load_state, TO, 1);
-        }
+			// if not at end of file, alert read thread to load next buffer,
+			// alternate between g.in_buf and g.in_buf2
+			if (g.in_len == BUF) {
+				g.in_which = 1 - g.in_which;
+				possess(g.load_state);
+				twist(g.load_state, TO, 1);
+			}
 
-        // at end of file -- join read thread (already exited), clean up
-        else {
-            join(g.load_thread);
-            free_lock(g.load_state);
-            g.in_which = -1;
-        }
+			// at end of file -- join read thread (already exited), clean up
+			else {
+				join(g.load_thread);
+				free_lock(g.load_state);
+				g.in_which = -1;
+			}
+		} catch (err) {
+			complain("pthreads unavailable, falling back to single-threaded mode");
+			// do the same thing as we would if processes = 1 was provided by user.
+			// (i.e. what's done below in the else)
+			// note: see parallel_compress.
+			g.procs = 1;
+			g.in_left = readn(g.ind, g.in_next = g.in_buf, BUF);
+		}
     }
     else
 #endif
